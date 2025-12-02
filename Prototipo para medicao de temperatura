@@ -1,0 +1,269 @@
+Autor: Ivan de Oliveira Bessa 
+Curso: Engenharia da Computacao
+Instituicao: UNINTER
+Ano: 2025
+
+
+Descricao:
+-----------
+Este codigo implementa uma medicao de temperatura ambiente ao redor de placas PCB utilizando um sensor de temperatura e umidade (DHT11) com um display LCD 16x2 e uma led simples de alerta.
+
+
+
+// ================== CONFIG BITS PIC16F877A ==================
+#define _XTAL_FREQ 4000000UL    // 4 MHz (ajuste se seu cristal for outro)
+
+#pragma config FOSC = XT        // Oscilador XT (cristal até 4 MHz)
+#pragma config WDTE = OFF       // Watchdog Timer OFF
+#pragma config PWRTE = ON       // Power-up Timer ON
+#pragma config BOREN = OFF      // Brown-out Reset OFF
+#pragma config LVP  = OFF       // Low-voltage Programming OFF (RB3 como I/O)
+#pragma config CPD  = OFF       // Proteção EEPROM OFF
+#pragma config WRT  = OFF       // Write protection OFF
+#pragma config CP   = OFF       // Code protection OFF         
+
+#include <xc.h>
+#include <stdint.h>
+
+// ============= DEFINIÇÕES DO LCD (ligado na PORTD) =========
+#define LCD_RS   PORTDbits.RD2
+#define LCD_EN   PORTDbits.RD3
+#define LCD_D4   PORTDbits.RD4
+#define LCD_D5   PORTDbits.RD5
+#define LCD_D6   PORTDbits.RD6
+#define LCD_D7   PORTDbits.RD7
+
+#define LCD_RS_TRIS   TRISDbits.TRISD2
+#define LCD_EN_TRIS   TRISDbits.TRISD3
+#define LCD_D4_TRIS   TRISDbits.TRISD4
+#define LCD_D5_TRIS   TRISDbits.TRISD5
+#define LCD_D6_TRIS   TRISDbits.TRISD6
+#define LCD_D7_TRIS   TRISDbits.TRISD7
+
+// ============= DEFINIÇÕES DO DHT11 (RA0) =============
+#define DHT_DIR   TRISAbits.TRISA0   // 0 = saída, 1 = entrada
+#define DHT_PIN   PORTAbits.RA0
+
+// LED de alerta em RB0
+#define LED_TRIS  TRISBbits.TRISB0
+#define LED       PORTBbits.RB0
+
+// -------- Funções básicas do LCD em 4 bits --------
+void lcd_pulse_enable(void)
+{
+    LCD_EN = 1;
+    __delay_us(2);
+    LCD_EN = 0;
+    __delay_us(50);
+}
+
+void lcd_send_nibble(uint8_t nibble)
+{
+    LCD_D4 = (nibble >> 0) & 0x01;
+    LCD_D5 = (nibble >> 1) & 0x01;
+    LCD_D6 = (nibble >> 2) & 0x01;
+    LCD_D7 = (nibble >> 3) & 0x01;
+    lcd_pulse_enable();
+}
+
+void lcd_send_byte(uint8_t rs, uint8_t data)
+{
+    LCD_RS = rs;          // 0 = comando, 1 = dado
+    lcd_send_nibble((data >> 4) & 0x0F);   // parte alta
+    lcd_send_nibble(data & 0x0F);          // parte baixa
+}
+
+void lcd_cmd(uint8_t cmd)
+{
+    lcd_send_byte(0, cmd);
+    if (cmd == 0x01 || cmd == 0x02)  // clear/home
+        __delay_ms(2);
+}
+
+void lcd_char(char c)
+{
+    lcd_send_byte(1, c);
+}
+
+void lcd_string(const char *s)
+{
+    while (*s)
+    {
+        lcd_char(*s++);
+    }
+}
+
+void lcd_goto(uint8_t linha, uint8_t coluna)
+{
+    uint8_t addr = (linha == 1 ? 0x00 : 0x40) + (coluna - 1);
+    lcd_cmd(0x80 | addr);
+}
+
+void lcd_clear(void)
+{
+    lcd_cmd(0x01);
+    __delay_ms(2);
+}
+
+void lcd_init(void)
+{
+    // Configura TRIS
+    LCD_RS_TRIS = 0;
+    LCD_EN_TRIS = 0;
+    LCD_D4_TRIS = 0;
+    LCD_D5_TRIS = 0;
+    LCD_D6_TRIS = 0;
+    LCD_D7_TRIS = 0;
+
+    __delay_ms(20);   // espera depois de ligar
+
+    LCD_RS = 0;
+    LCD_EN = 0;
+
+    // sequência padrão de inicialização do HD44780 em 4 bits
+    lcd_send_nibble(0x03);
+    __delay_ms(5);
+    lcd_send_nibble(0x03);
+    __delay_us(200);
+    lcd_send_nibble(0x03);
+    __delay_us(200);
+    lcd_send_nibble(0x02);   // 4 bits
+    __delay_us(200);
+
+    lcd_cmd(0x28);   // 4 bits, 2 linhas, 5x8
+    lcd_cmd(0x0C);   // display ON, cursor OFF
+    lcd_cmd(0x06);   // entry mode
+    lcd_clear();
+}
+
+// ==================== DHT11 ====================
+
+void DHT11_Start(void)
+{
+    DHT_DIR = 0;     // saída
+    DHT_PIN = 0;     // puxa baixo
+    __delay_ms(20);  // pelo menos 18ms
+    DHT_PIN = 1;     // libera linha
+    __delay_us(30);
+    DHT_DIR = 1;     // entrada
+}
+
+uint8_t DHT11_CheckResponse(void)
+{
+    uint8_t resp = 0;
+    __delay_us(40);
+    if (DHT_PIN == 0)
+    {
+        __delay_us(80);
+        if (DHT_PIN == 1) resp = 1;
+        __delay_us(40);
+    }
+    return resp;
+}
+
+uint8_t DHT11_ReadByte(void)
+{
+    uint8_t i, byte = 0;
+
+    for (i = 0; i < 8; i++)
+    {
+        // espera início do bit (linha sobe)
+        while (DHT_PIN == 0);
+        __delay_us(30);
+        if (DHT_PIN == 1)
+        {
+            byte |= (1 << (7 - i));   // bit 1
+        }
+        // espera fim do bit (linha desce)
+        while (DHT_PIN == 1);
+    }
+    return byte;
+}
+
+// ======================== MAIN =========================
+void main(void)
+{
+    // Desabilita ADC para usar RA0 como digital
+    ADCON1 = 0x06;
+
+    // LED RB0 como saída
+    LED_TRIS = 0;
+    LED = 0;
+
+    // RA0 como entrada inicialmente (DHT inativo)
+    DHT_DIR = 1;
+
+    // Inicializa LCD
+    lcd_init();
+
+    uint8_t hum_int, hum_dec, temp_int, temp_dec, chksum;
+    uint8_t ok;
+
+    while (1)
+    {
+        DHT11_Start();
+        ok = DHT11_CheckResponse();
+
+        if (ok)
+        {
+            hum_int  = DHT11_ReadByte();
+            hum_dec  = DHT11_ReadByte();
+            temp_int = DHT11_ReadByte();
+            temp_dec = DHT11_ReadByte();
+            chksum   = DHT11_ReadByte();
+
+            if ((uint8_t)(hum_int + hum_dec + temp_int + temp_dec) == chksum)
+            {
+                // ----- Atualiza LCD -----
+                lcd_clear();
+
+                // Linha 1: T=27°C U=55%
+                lcd_goto(1,1);
+                lcd_string("T=");
+                lcd_char((temp_int/10) + '0');
+                lcd_char((temp_int%10) + '0');
+                lcd_char(223);      // simbolo ° em muitos LCDs
+                lcd_char('C');
+                lcd_string(" U=");
+                lcd_char((hum_int/10) + '0');
+                lcd_char((hum_int%10) + '0');
+                lcd_char('%');
+
+                // Linha 2: STATUS ou ALERTA
+                lcd_goto(2,1);
+                if (temp_int >= 30)
+                {
+                    lcd_string("ALTA TEMPERATURA!");
+                    LED = 1;   // liga LED alerta
+                }
+                else
+                {
+                    lcd_string("STATUS: OK       ");
+                    LED = 0;   // desliga LED
+                }
+            }
+            else
+            {
+                // Erro de checksum
+                lcd_clear();
+                lcd_goto(1,1);
+                lcd_string("ERRO LEITURA");
+                lcd_goto(2,1);
+                lcd_string("CHECKSUM DHT11");
+                LED = 0;
+            }
+        }
+        else
+        {
+            // Sem resposta do DHT11
+            lcd_clear();
+            lcd_goto(1,1);
+            lcd_string("SEM RESPOSTA");
+            lcd_goto(2,1);
+            lcd_string("VERIFIQUE DHT11");
+            LED = 0;
+        }
+
+        __delay_ms(1000); // lê a cada 1 segundo
+    }
+}
